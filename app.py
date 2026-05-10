@@ -22,6 +22,9 @@ DB_CONFIG = {
     'autocommit': True
 }
 
+# Jaw Length (mm)
+L = 100
+
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'secret!'
 socketio = SocketIO(app, cors_allowed_origins="*")
@@ -57,6 +60,7 @@ def init_db():
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS patients (
                     id INT AUTO_INCREMENT PRIMARY KEY,
+                    unique_id VARCHAR(50) UNIQUE,
                     doctor_id INT,
                     patient_name VARCHAR(100) NOT NULL,
                     age INT,
@@ -68,19 +72,21 @@ def init_db():
                     FOREIGN KEY (doctor_id) REFERENCES doctors(id)
                 )
             """)
+            # Ensure unique_id column exists for existing tables
+            try:
+                cursor.execute("ALTER TABLE patients ADD COLUMN unique_id VARCHAR(50) UNIQUE AFTER id")
+                print("Added unique_id column to patients table.")
+            except Exception as e:
+                if "Duplicate column name" not in str(e):
+                    print(f"Alter table error: {e}")
+
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS session_data (
                     id INT AUTO_INCREMENT PRIMARY KEY,
                     patient_id VARCHAR(50),
                     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    jaw_disp FLOAT,
-                    velocity FLOAT,
-                    acceleration FLOAT,
-                    rom FLOAT,
-                    symmetry FLOAT,
-                    chewing_frequency FLOAT,
-                    lateral_excursion FLOAT,
-                    protrusive_angle FLOAT
+                    protrusive_angle FLOAT,
+                    protrusive_disp FLOAT
                 )
             """)
         conn.close()
@@ -139,24 +145,19 @@ class State:
         self.theta_buffer = []
         self.theta_ref = None
 
-        self.prev_disp = 0
-        self.prev_time = 0
-        self.prev_velocity = 0
-
-        self.max_disp = 0
-        self.min_disp = 0
-
-        self.jaw_disp = 0
-        self.jaw_velocity = 0
-        self.jaw_acceleration = 0
-        self.rom = 0
-        self.angular_velocity = 0
-        self.symmetry = 0
-        self.chewing_frequency = 0
         self.protrusive_angle = 0
-        self.lateral_excursion = 0
+        self.protrusive_disp = 0
 
         self.last_db_save_time = 0
+        
+        # Stability tracking
+        self.stable_start = time.time()
+        self.prev_protrusive_angle = 0
+        self.reported = False
+        self.returned = False
+        self.is_moving = False
+        self.final_angle = 0
+        self.final_disp = 0
 
 state = State()
 
@@ -201,6 +202,8 @@ def process_realtime(patient_id):
         state.lower_base = np.mean(state.lower_angles[:50], axis=0)
         state.calibrated = True
         print("✅ Calibration Done")
+        socketio.emit('session_status', {'message': 'Calibration Done', 'type': 'success'})
+        socketio.emit('session_status', {'message': 'READY TO TAKE READING', 'type': 'ready'})
         return None
 
     upper = np.array(state.upper_angles[-1])
@@ -214,128 +217,105 @@ def process_realtime(patient_id):
     roll_rel, pitch_rel = rel
     protrusive_angle = pitch_rel
 
-    # ALIGNMENT
-    if state.align_offset is None:
-        state.align_offset = np.array([roll_rel, pitch_rel])
-        print("✅ Sensors aligned")
-        return None
-
-    roll_rel -= state.align_offset[0]
-    pitch_rel -= state.align_offset[1]
-
-    theta_pitch = np.radians(pitch_rel)
-    theta_roll = np.radians(roll_rel)
-    theta = np.sqrt(theta_pitch**2 + theta_roll**2)
-
-    # ZERO LOCK
-    if state.theta_ref is None:
-        state.theta_buffer.append(theta)
-        if len(state.theta_buffer) < 50:
-            state.jaw_disp = 0
-            state.protrusive_angle = 0
-            state.lateral_excursion = 0
-            return None
-        state.theta_ref = np.mean(state.theta_buffer)
-        print("✅ Zero locked")
-        return None
-
-    theta_rel = theta - state.theta_ref
-    if abs(theta_rel) < np.radians(0.5):
-        theta_rel = 0
-
-    jaw_disp = 2 * L * np.sin(theta_rel / 2)
-    if abs(jaw_disp) < 0.5:
-        jaw_disp = 0
-
-    lateral_excursion = 2 * L * np.sin(theta_roll / 2)
-    if abs(lateral_excursion) < 0.5:
-        lateral_excursion = 0
-
     current_time = time.time()
-    dt = current_time - state.prev_time
-    if dt <= 0:
-        dt = 0.001
+    # =====================================================
+    # STABILITY LOGIC (from hardware code)
+    # =====================================================
+    MIN_PROTRUSIVE_ANGLE = 2.0
+    STABILITY_THRESHOLD = 0.15
+    RETURN_THRESHOLD = 1.0
+    STABLE_TIME = 3.0
+    MOTION_THRESHOLD = 0.5
 
-    jaw_velocity = (jaw_disp - state.prev_disp) / dt
-    state.prev_disp = jaw_disp
-    state.prev_time = current_time
+    # Noise rejection
+    current_protrusive_angle = protrusive_angle
+    stable_duration = 0  # Initialize to prevent UnboundLocalError
+    if abs(current_protrusive_angle) < MIN_PROTRUSIVE_ANGLE:
+        current_protrusive_angle = 0
 
-    jaw_acceleration = (jaw_velocity - state.prev_velocity) / dt
-    state.prev_velocity = jaw_velocity
+    # Stability check
+    angle_diff = abs(current_protrusive_angle - state.prev_protrusive_angle)
+    current_motion = abs(current_protrusive_angle)
+    if current_motion > MOTION_THRESHOLD:
+        if not state.is_moving:
+            socketio.emit('session_status', {'message': 'Protrusive Motion Detected', 'type': 'motion'})
+        state.is_moving = True
+        state.stable_start = current_time
+    elif angle_diff < STABILITY_THRESHOLD:
+        stable_duration = current_time - state.stable_start
+        if 0.1 < stable_duration < 0.2: # Emit only once at start of stability
+            socketio.emit('session_status', {'message': 'Hold Jaw Steady for 3 sec...', 'type': 'steady'})
+    else:
+        state.stable_start = current_time
+        stable_duration = 0
+    
+    state.prev_protrusive_angle = current_protrusive_angle
 
-    state.max_disp = max(state.max_disp, jaw_disp)
-    state.min_disp = min(state.min_disp, jaw_disp)
-    rom = state.max_disp - state.min_disp
+    # Return to zero check
+    if abs(current_protrusive_angle) < RETURN_THRESHOLD:
+        if state.reported and not state.returned:
+            print("↩ Returned to Initial Position")
+            state.returned = True
+        
+        state.final_angle = 0
+        state.final_disp = 0
+        
+        if state.reported:
+            state.reported = False
+            state.stable_start = current_time
+    else:
+        state.returned = False
 
-    angular_velocity = np.sqrt(roll_rel**2 + pitch_rel**2)
-    symmetry = abs(roll_rel)
+    # Calculate LIVE displacement (matching script logic)
+    theta_live = np.radians(current_protrusive_angle)
+    live_disp = 2 * L * np.sin(theta_live / 2)
+    if abs(live_disp) < 0.5:
+        live_disp = 0
 
-    scale = 2
-    lx = clamp(scale * pitch_rel)
-    ly = clamp(scale * roll_rel)
-    lz = clamp(jaw_disp)
+    # Calculate final measurement once stable
+    if stable_duration >= STABLE_TIME and not state.reported:
+        state.final_disp = live_disp
+        state.final_angle = current_protrusive_angle
+        state.reported = True
+        print(f"✅ Protrusive Measured: {state.final_angle:.2f} deg, {state.final_disp:.2f} mm")
 
-    state.full_x.append(lx)
-    state.full_y.append(ly)
-    state.full_z.append(lz)
-    state.timestamps.append(current_time)
+    # Update state values for database/UI (Live values)
+    state.protrusive_angle = current_protrusive_angle
+    state.protrusive_disp = live_disp
 
-    if len(state.full_x) >= 15:
-        state.full_x[-1] = savgol_filter(state.full_x[-15:], 7, 2)[-1]
-        state.full_y[-1] = savgol_filter(state.full_y[-15:], 7, 2)[-1]
-        state.full_z[-1] = savgol_filter(state.full_z[-15:], 7, 2)[-1]
-
-    if len(state.full_x) > MAX_POINTS:
-        state.full_x.pop(0)
-        state.full_y.pop(0)
-        state.full_z.pop(0)
-        state.timestamps.pop(0)
-
-    chewing_frequency = 0
-    if len(state.full_z) > 100:
-        peaks, _ = find_peaks(state.full_z, distance=20)
-        total_time = state.timestamps[-1] - state.timestamps[0]
-        if total_time > 0:
-            chewing_frequency = len(peaks) / total_time
-
-    # Update state
-    state.jaw_disp = jaw_disp
-    state.jaw_velocity = jaw_velocity
-    state.jaw_acceleration = jaw_acceleration
-    state.rom = rom
-    state.angular_velocity = angular_velocity
-    state.symmetry = symmetry
-    state.chewing_frequency = chewing_frequency
-    state.protrusive_angle = protrusive_angle
-    state.lateral_excursion = lateral_excursion
-
-    # Database saving at 15Hz (approx 0.066s interval)
+    # Database saving at 15Hz
     if (current_time - state.last_db_save_time) >= (1.0 / 15.0):
         state.last_db_save_time = current_time
-        save_to_db(patient_id, jaw_disp, jaw_velocity, jaw_acceleration, rom, symmetry, chewing_frequency, lateral_excursion, protrusive_angle)
+        save_to_db(patient_id, state.protrusive_angle, state.protrusive_disp)
+        if state.reported:
+            print(f"✅ Captured - Angle: {state.protrusive_angle:.2f}, Disp: {state.protrusive_disp:.2f}")
+            socketio.emit('session_status', {
+                'message': f'Measurement Captured: {state.protrusive_angle:.2f}°',
+                'type': 'result'
+            })
 
+    # Check if back to initial position
+    if state.calibrated and abs(current_protrusive_angle) < 0.5 and state.is_moving:
+        state.is_moving = False
+        socketio.emit('session_status', {'message': 'Returned to Initial Position', 'type': 'info'})
+        socketio.emit('session_status', {'message': 'READY TO TAKE READING', 'type': 'ready'})
+
+    # 4. Return Results
     return {
-        "disp": jaw_disp,
-        "vel": jaw_velocity,
-        "acc": jaw_acceleration,
-        "rom": rom,
-        "freq": chewing_frequency,
-        "sym": symmetry,
-        "pitch": lx,
-        "roll": ly,
-        "jaw_opening": lz
+        "protrusive_angle": state.protrusive_angle,
+        "protrusive_disp": state.protrusive_disp
     }
 
-def save_to_db(patient_id, disp, vel, acc, rom, sym, freq, lat, protrusive):
+def save_to_db(patient_id, protrusive, protrusive_disp):
     def insert():
         try:
             conn = pymysql.connect(**DB_CONFIG)
             with conn.cursor() as cursor:
                 cursor.execute("""
                     INSERT INTO session_data 
-                    (patient_id, jaw_disp, velocity, acceleration, rom, symmetry, chewing_frequency, lateral_excursion, protrusive_angle) 
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """, (patient_id, disp, vel, acc, rom, sym, freq, lat, protrusive))
+                    (patient_id, protrusive_angle, protrusive_disp) 
+                    VALUES (%s, %s, %s)
+                """, (patient_id, protrusive, protrusive_disp))
             conn.close()
         except Exception as e:
             print(f"DB Insert Error: {e}")
@@ -366,11 +346,12 @@ def handle_sensor_data(data):
     try:
         current_time = time.time()
         patient_id = data.get('patient_id', 'Unknown')
+        print(f"📦 Incoming Socket Data from Patient: {patient_id}")
         
         # Process Upper
         upper = data.get('upper')
-        if upper and len(upper) == 6:
-            ax, ay, az, gx, gy, gz = upper
+        if upper and len(upper) >= 6:
+            ax, ay, az, gx, gy, gz = upper[:6]
             state.upper_roll, state.upper_pitch, state.prev_time_upper = fuse_imu(
                 ax, ay, az, gx, gy,
                 state.upper_roll, state.upper_pitch, state.prev_time_upper,
@@ -380,8 +361,8 @@ def handle_sensor_data(data):
 
         # Process Lower
         lower = data.get('lower')
-        if lower and len(lower) == 6:
-            ax, ay, az, gx, gy, gz = lower
+        if lower and len(lower) >= 6:
+            ax, ay, az, gx, gy, gz = lower[:6]
             state.lower_roll, state.lower_pitch, state.prev_time_lower = fuse_imu(
                 ax, ay, az, gx, gy,
                 state.lower_roll, state.lower_pitch, state.prev_time_lower,
@@ -473,6 +454,41 @@ def login():
         print(f"Login error: {e}")
         return jsonify({"message": "Internal server error"}), 500
 
+@app.route('/auth/update-doctor', methods=['POST'])
+@app.route('/auth/update-doctor/', methods=['POST'])
+def update_doctor():
+    print("Received update_doctor request")
+    data = request.json
+    doctor_id = data.get('id')
+    full_name = data.get('full_name')
+    email = data.get('email')
+    phone = data.get('phone')
+    hospital_name = data.get('hospital_name')
+    specialization = data.get('specialization')
+
+    if not all([doctor_id, full_name, email]):
+        return jsonify({"message": "Missing required fields"}), 400
+
+    try:
+        conn = pymysql.connect(**DB_CONFIG)
+        with conn.cursor() as cursor:
+            # Check if email is taken by another doctor
+            cursor.execute("SELECT id FROM doctors WHERE email = %s AND id != %s", (email, doctor_id))
+            if cursor.fetchone():
+                conn.close()
+                return jsonify({"message": "Email already in use"}), 409
+
+            cursor.execute("""
+                UPDATE doctors 
+                SET full_name = %s, email = %s, phone = %s, hospital_name = %s, specialization = %s
+                WHERE id = %s
+            """, (full_name, email, phone, hospital_name, specialization, doctor_id))
+        conn.close()
+        return jsonify({"message": "Profile updated successfully"}), 200
+    except Exception as e:
+        print(f"Update error: {e}")
+        return jsonify({"message": "Internal server error"}), 500
+
 @app.route('/patients', methods=['POST'])
 @app.route('/patients/', methods=['POST'])
 def add_patient():
@@ -481,28 +497,42 @@ def add_patient():
     doctor_id = data.get('doctor_id')
     patient_name = data.get('patient_name')
     age = data.get('age')
-    gender = data.get('gender')
     phone = data.get('phone')
-    medical_condition = data.get('medical_condition')
-    assigned_exercise = data.get('assigned_exercise')
+    
+    # Optional fields for backward compatibility if needed, but the user wants only name, age, phone
+    gender = data.get('gender', 'Not Specified')
+    medical_condition = data.get('medical_condition', '')
+    assigned_exercise = data.get('assigned_exercise', '')
 
     if not doctor_id or not patient_name:
         print("Error: Missing doctor_id or patient_name")
         return jsonify({"message": "Doctor ID and Patient Name are required"}), 400
 
+    # Generate Unique Patient ID
+    unique_id = f"PAT-{int(time.time() * 1000) % 1000000:06d}"
+
     try:
         conn = pymysql.connect(**DB_CONFIG)
         with conn.cursor() as cursor:
+            # Check if unique_id exists (highly unlikely but good practice)
+            cursor.execute("SELECT id FROM patients WHERE unique_id = %s", (unique_id,))
+            if cursor.fetchone():
+                unique_id = f"PAT-{int(time.time() * 1000) % 1000000 + 1:06d}"
+
             cursor.execute("""
-                INSERT INTO patients (doctor_id, patient_name, age, gender, phone, medical_condition, assigned_exercise)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-            """, (doctor_id, patient_name, age, gender, phone, medical_condition, assigned_exercise))
+                INSERT INTO patients (unique_id, doctor_id, patient_name, age, gender, phone, medical_condition, assigned_exercise)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            """, (unique_id, doctor_id, patient_name, age, gender, phone, medical_condition, assigned_exercise))
         conn.close()
-        print(f"Patient {patient_name} added successfully for doctor {doctor_id}")
-        return jsonify({"message": "Patient added successfully"}), 201
+        print(f"Patient {patient_name} (ID: {unique_id}) added successfully for doctor {doctor_id}")
+        return jsonify({
+            "message": "Patient added successfully",
+            "unique_id": unique_id
+        }), 201
     except Exception as e:
         print(f"Error adding patient: {e}")
         return jsonify({"message": str(e)}), 500
+
 
 @app.route('/patients', methods=['GET'])
 @app.route('/patients/', methods=['GET'])
@@ -514,14 +544,105 @@ def get_patients():
     try:
         conn = pymysql.connect(**DB_CONFIG)
         with conn.cursor(pymysql.cursors.DictCursor) as cursor:
-            cursor.execute("SELECT * FROM patients WHERE doctor_id = %s", (doctor_id,))
+            cursor.execute("""
+                SELECT p.*, 
+                (SELECT protrusive_angle FROM session_data WHERE patient_id = p.unique_id ORDER BY timestamp DESC LIMIT 1) as latest_angle
+                FROM patients p WHERE p.doctor_id = %s
+            """, (doctor_id,))
             patients = cursor.fetchall()
+
         conn.close()
         return jsonify(patients), 200
     except Exception as e:
         return jsonify({"message": str(e)}), 500
 
+@app.route('/stats', methods=['GET'])
+def get_stats():
+    doctor_id = request.args.get('doctor_id')
+    if not doctor_id:
+        return jsonify({"message": "Doctor ID is required"}), 400
+
+    try:
+        conn = pymysql.connect(**DB_CONFIG)
+        with conn.cursor(pymysql.cursors.DictCursor) as cursor:
+            # Total Patients
+            cursor.execute("SELECT COUNT(*) as count FROM patients WHERE doctor_id = %s", (doctor_id,))
+            total_patients = cursor.fetchone()['count']
+
+            # Active Sessions (unique patients who had sessions in the last 7 days)
+            cursor.execute("""
+                SELECT COUNT(DISTINCT patient_id) as count 
+                FROM session_data 
+                WHERE timestamp >= DATE_SUB(NOW(), INTERVAL 7 DAY)
+                AND patient_id IN (SELECT unique_id FROM patients WHERE doctor_id = %s)
+            """, (doctor_id,))
+            active_sessions = cursor.fetchone()['count']
+
+            # Avg Recovery (based on max angle, benchmark 45°)
+            cursor.execute("""
+                SELECT AVG(protrusive_angle) as avg_angle 
+                FROM session_data 
+                WHERE patient_id IN (SELECT unique_id FROM patients WHERE doctor_id = %s)
+            """, (doctor_id,))
+            avg_angle = cursor.fetchone()['avg_angle'] or 0
+            avg_recovery = (avg_angle / 45.0) * 100
+
+            # Reports Today
+            cursor.execute("""
+                SELECT COUNT(*) as count 
+                FROM session_data 
+                WHERE DATE(timestamp) = CURDATE()
+                AND patient_id IN (SELECT unique_id FROM patients WHERE doctor_id = %s)
+            """, (doctor_id,))
+            reports_today = cursor.fetchone()['count']
+
+        conn.close()
+        return jsonify({
+            "total_patients": total_patients,
+            "active_sessions": active_sessions,
+            "avg_recovery": round(min(avg_recovery, 100.0), 1),
+            "reports_today": reports_today
+        }), 200
+    except Exception as e:
+        return jsonify({"message": str(e)}), 500
+
+
+@app.route('/sessions', methods=['GET'])
+
+@app.route('/sessions/', methods=['GET'])
+def get_sessions():
+    patient_id = request.args.get('patient_id')
+    if not patient_id:
+        return jsonify({"message": "Patient ID is required"}), 400
+
+    try:
+        conn = pymysql.connect(**DB_CONFIG)
+        with conn.cursor(pymysql.cursors.DictCursor) as cursor:
+            # Get aggregated session data per day or raw data
+            cursor.execute("""
+                SELECT 
+                    DATE(timestamp) as session_date,
+                    MAX(protrusive_angle) as max_angle,
+                    MAX(protrusive_disp) as max_disp
+                FROM session_data 
+                WHERE patient_id = %s
+                GROUP BY DATE(timestamp)
+                ORDER BY session_date DESC
+            """, (patient_id,))
+            sessions = cursor.fetchall()
+            
+            # Convert dates to strings for JSON serialization
+            for session in sessions:
+                if 'session_date' in session and session['session_date']:
+                    session['session_date'] = session['session_date'].strftime('%Y-%m-%d')
+                    
+        conn.close()
+        return jsonify(sessions), 200
+    except Exception as e:
+        print(f"Error fetching sessions: {e}")
+        return jsonify({"message": str(e)}), 500
+
 if __name__ == '__main__':
     init_db()
     print("Starting Flask SocketIO Server on port 5000...")
-    socketio.run(app, host='0.0.0.0', port=5000, allow_unsafe_werkzeug=True)
+    socketio.run(app, host='0.0.0.0', port=5000, allow_unsafe_werkzeug=True, debug=True)
