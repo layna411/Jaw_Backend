@@ -1,6 +1,7 @@
 import time
 import numpy as np
 from scipy.signal import savgol_filter, find_peaks
+from scipy.spatial.transform import Rotation as R
 from flask import Flask, request, jsonify
 from flask_socketio import SocketIO, emit
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -12,6 +13,10 @@ from datetime import datetime
 # CONFIGURATION
 # =========================================================
 L = 100  # Jaw length (mm)
+RADIUS = 100 # Protrusive arc radius (mm)
+ANGLE_THRESHOLD = 0.5 # Degrees
+DISP_THRESHOLD = 0.1 # mm
+CAL_GAIN = 1.0 # Calibration multiplier
 MAX_POINTS = 10000
 
 DB_CONFIG = {
@@ -21,9 +26,6 @@ DB_CONFIG = {
     'database': 'jaw_rehab',
     'autocommit': True
 }
-
-# Jaw Length (mm)
-L = 100
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'secret!'
@@ -124,53 +126,35 @@ class State:
 
         self.upper_roll = 0
         self.upper_pitch = 0
+        self.upper_yaw = 0
         self.lower_roll = 0
         self.lower_pitch = 0
+        self.lower_yaw = 0
+        
         self.prev_time_upper = None
         self.prev_time_lower = None
 
-        self.upper_angles = []
-        self.lower_angles = []
-
-        self.full_x = []
-        self.full_y = []
-        self.full_z = []
-        self.timestamps = []
-
+        self.samples = []
         self.calibrated = False
-        self.upper_base = None
-        self.lower_base = None
-        self.align_offset = None
+        self.base = 0
         
-        self.theta_buffer = []
-        self.theta_ref = None
-
+        self.measure = False
+        self.max_angle = 0
+        self.max_disp = 0
+        self.last_move = 0
+        
         self.protrusive_angle = 0
         self.protrusive_disp = 0
-
         self.last_db_save_time = 0
-        
-        # Stability tracking
-        self.stable_start = time.time()
-        self.prev_protrusive_angle = 0
-        self.reported = False
-        self.returned = False
-        self.is_moving = False
-        self.final_angle = 0
-        self.final_disp = 0
 
 state = State()
 
-def clamp(v, limit=50):
-    return max(min(v, limit), -limit)
-
-def fuse_imu(ax, ay, az, gx, gy, prev_roll, prev_pitch, prev_time, kf_roll, kf_pitch, current_time):
+def fuse_imu(ax, ay, az, gx, gy, gz, prev_roll, prev_pitch, prev_yaw, prev_time, kf_roll, kf_pitch, current_time):
     if prev_time is None:
-        return prev_roll, prev_pitch, current_time
+        return prev_roll, prev_pitch, prev_yaw, current_time
 
     dt = current_time - prev_time
-    if dt <= 0:
-        dt = 0.001
+    if dt <= 0: dt = 0.001
 
     roll_acc = np.degrees(np.arctan2(ay, az))
     pitch_acc = np.degrees(np.arctan2(-ax, np.sqrt(ay**2 + az**2)))
@@ -185,125 +169,84 @@ def fuse_imu(ax, ay, az, gx, gy, prev_roll, prev_pitch, prev_time, kf_roll, kf_p
 
     roll = kf_roll.update(roll_acc, gx, dt)
     pitch = kf_pitch.update(pitch_acc, gy, dt)
+    yaw = prev_yaw + gz * dt
 
-    if abs(gx) < 0.5 and abs(gy) < 0.5:
-        roll *= 0.995
-        pitch *= 0.995
+    return roll, pitch, yaw, current_time
 
-    return roll, pitch, current_time
+def get_quaternion(roll, pitch, yaw):
+    from scipy.spatial.transform import Rotation as R
+    return R.from_euler('xyz', [roll, pitch, yaw], degrees=True)
 
 def process_realtime(patient_id):
-    if len(state.upper_angles) < 50 or len(state.lower_angles) < 50:
-        return None
+    global state
+    
+    # 1. Check if we have enough orientation data
+    # (Simplified: we use the latest fused values)
+    
+    u_quat = get_quaternion(state.upper_roll, state.upper_pitch, state.upper_yaw)
+    l_quat = get_quaternion(state.lower_roll, state.lower_pitch, state.lower_yaw)
+    
+    # RELATIVE ORIENTATION
+    rel = u_quat.inv() * l_quat
+    rotvec = rel.as_rotvec()
+    protrusive_raw = np.degrees(rotvec[1]) # Y-axis rotation (Pitch)
 
-    # CALIBRATION
+    # 2. CALIBRATION (100 samples median)
     if not state.calibrated:
-        state.upper_base = np.mean(state.upper_angles[:50], axis=0)
-        state.lower_base = np.mean(state.lower_angles[:50], axis=0)
+        state.samples.append(protrusive_raw)
+        progress = len(state.samples)
+        socketio.emit('session_status', {'message': f'Calibrating {progress}/100', 'type': 'steady'})
+        
+        if len(state.samples) < 100:
+            return None
+            
+        state.base = np.median(state.samples)
         state.calibrated = True
-        print("✅ Calibration Done")
-        socketio.emit('session_status', {'message': 'Calibration Done', 'type': 'success'})
-        socketio.emit('session_status', {'message': 'READY TO TAKE READING', 'type': 'ready'})
+        state.measure = False
+        print("✅ CALIBRATION DONE")
+        socketio.emit('session_status', {'message': 'CALIBRATION DONE', 'type': 'success'})
+        socketio.emit('session_status', {'message': 'READY TO MOVE JAW', 'type': 'ready'})
         return None
 
-    upper = np.array(state.upper_angles[-1])
-    lower = np.array(state.lower_angles[-1])
+    # 3. MEASUREMENT TRIGGER (Always on after calibration for live view)
+    angle = protrusive_raw - state.base
+    if abs(angle) < ANGLE_THRESHOLD:
+        angle = 0
+        
+    theta = np.radians(angle)
+    raw_disp = 2 * RADIUS * np.sin(theta / 2)
+    protrusive_disp = CAL_GAIN * raw_disp
+    
+    if abs(protrusive_disp) < DISP_THRESHOLD:
+        protrusive_disp = 0
 
-    upper_corr = upper - state.upper_base
-    lower_corr = lower - state.lower_base
-
-    # RELATIVE MOTION
-    rel = upper_corr - lower_corr
-    roll_rel, pitch_rel = rel
-    protrusive_angle = pitch_rel
+    # TRACK MAX
+    if abs(angle) > abs(state.max_angle):
+        state.max_angle = angle
+        state.max_disp = protrusive_disp
+        state.last_move = time.time()
 
     current_time = time.time()
-    # =====================================================
-    # STABILITY LOGIC (from hardware code)
-    # =====================================================
-    MIN_PROTRUSIVE_ANGLE = 2.0
-    STABILITY_THRESHOLD = 0.15
-    RETURN_THRESHOLD = 1.0
-    STABLE_TIME = 3.0
-    MOTION_THRESHOLD = 0.5
-
-    # Noise rejection
-    current_protrusive_angle = protrusive_angle
-    stable_duration = 0  # Initialize to prevent UnboundLocalError
-    if abs(current_protrusive_angle) < MIN_PROTRUSIVE_ANGLE:
-        current_protrusive_angle = 0
-
-    # Stability check
-    angle_diff = abs(current_protrusive_angle - state.prev_protrusive_angle)
-    current_motion = abs(current_protrusive_angle)
-    if current_motion > MOTION_THRESHOLD:
-        if not state.is_moving:
-            socketio.emit('session_status', {'message': 'Protrusive Motion Detected', 'type': 'motion'})
-        state.is_moving = True
-        state.stable_start = current_time
-    elif angle_diff < STABILITY_THRESHOLD:
-        stable_duration = current_time - state.stable_start
-        if 0.1 < stable_duration < 0.2: # Emit only once at start of stability
-            socketio.emit('session_status', {'message': 'Hold Jaw Steady for 3 sec...', 'type': 'steady'})
-    else:
-        state.stable_start = current_time
-        stable_duration = 0
     
-    state.prev_protrusive_angle = current_protrusive_angle
+    # Update state for reporting
+    state.protrusive_angle = angle
+    state.protrusive_disp = protrusive_disp
 
-    # Return to zero check
-    if abs(current_protrusive_angle) < RETURN_THRESHOLD:
-        if state.reported and not state.returned:
-            print("↩ Returned to Initial Position")
-            state.returned = True
-        
-        state.final_angle = 0
-        state.final_disp = 0
-        
-        if state.reported:
-            state.reported = False
-            state.stable_start = current_time
-    else:
-        state.returned = False
-
-    # Calculate LIVE displacement (matching script logic)
-    theta_live = np.radians(current_protrusive_angle)
-    live_disp = 2 * L * np.sin(theta_live / 2)
-    if abs(live_disp) < 0.5:
-        live_disp = 0
-
-    # Calculate final measurement once stable
-    if stable_duration >= STABLE_TIME and not state.reported:
-        state.final_disp = live_disp
-        state.final_angle = current_protrusive_angle
-        state.reported = True
-        print(f"✅ Protrusive Measured: {state.final_angle:.2f} deg, {state.final_disp:.2f} mm")
-
-    # Update state values for database/UI (Live values)
-    state.protrusive_angle = current_protrusive_angle
-    state.protrusive_disp = live_disp
-
-    # Database saving at 15Hz
-    if (current_time - state.last_db_save_time) >= (1.0 / 15.0):
+    # Database saving at 10Hz
+    if (current_time - state.last_db_save_time) >= 0.1:
         state.last_db_save_time = current_time
         save_to_db(patient_id, state.protrusive_angle, state.protrusive_disp)
-        if state.reported:
-            print(f"✅ Captured - Angle: {state.protrusive_angle:.2f}, Disp: {state.protrusive_disp:.2f}")
-            socketio.emit('session_status', {
-                'message': f'Measurement Captured: {state.protrusive_angle:.2f}°',
-                'type': 'result'
-            })
 
-    # Check if back to initial position
-    if state.calibrated and abs(current_protrusive_angle) < 0.5 and state.is_moving:
-        state.is_moving = False
-        socketio.emit('session_status', {'message': 'Returned to Initial Position', 'type': 'info'})
-        socketio.emit('session_status', {'message': 'READY TO TAKE READING', 'type': 'ready'})
+    # Emit results
+    articulator_payload = f"<{state.protrusive_angle:.2f},{state.protrusive_disp:.2f}>"
+    socketio.emit('articulator_cmd', articulator_payload)
+    print(f"🔌 Broadcasted to Articulator: {articulator_payload}")
 
-    # 4. Return Results
     return {
         "protrusive_angle": state.protrusive_angle,
-        "protrusive_disp": state.protrusive_disp
+        "protrusive_disp": state.protrusive_disp,
+        "max_angle": state.max_angle,
+        "max_disp": state.max_disp
     }
 
 def save_to_db(patient_id, protrusive, protrusive_disp):
@@ -333,6 +276,11 @@ def handle_connect():
 def handle_disconnect():
     print('Client disconnected from websocket.')
 
+@socketio.on('register_articulator')
+def handle_register_articulator():
+    print("🤖 ESP32 Articulator connected and registered via WebSockets!")
+    emit('status', {'message': 'Articulator registered successfully'})
+
 @socketio.on('sensor_data')
 def handle_sensor_data(data):
     """
@@ -352,28 +300,27 @@ def handle_sensor_data(data):
         upper = data.get('upper')
         if upper and len(upper) >= 6:
             ax, ay, az, gx, gy, gz = upper[:6]
-            state.upper_roll, state.upper_pitch, state.prev_time_upper = fuse_imu(
-                ax, ay, az, gx, gy,
-                state.upper_roll, state.upper_pitch, state.prev_time_upper,
+            state.upper_roll, state.upper_pitch, state.upper_yaw, state.prev_time_upper = fuse_imu(
+                ax, ay, az, gx, gy, gz,
+                state.upper_roll, state.upper_pitch, state.upper_yaw, state.prev_time_upper,
                 state.kf_roll_upper, state.kf_pitch_upper, current_time
             )
-            state.upper_angles.append([state.upper_roll, state.upper_pitch])
 
         # Process Lower
         lower = data.get('lower')
         if lower and len(lower) >= 6:
             ax, ay, az, gx, gy, gz = lower[:6]
-            state.lower_roll, state.lower_pitch, state.prev_time_lower = fuse_imu(
-                ax, ay, az, gx, gy,
-                state.lower_roll, state.lower_pitch, state.prev_time_lower,
+            state.lower_roll, state.lower_pitch, state.lower_yaw, state.prev_time_lower = fuse_imu(
+                ax, ay, az, gx, gy, gz,
+                state.lower_roll, state.lower_pitch, state.lower_yaw, state.prev_time_lower,
                 state.kf_roll_lower, state.kf_pitch_lower, current_time
             )
-            state.lower_angles.append([state.lower_roll, state.lower_pitch])
 
         # Compute Metrics
         metrics = process_realtime(patient_id)
         
         if metrics:
+            print(f"📊 Emitting metrics to Patient {patient_id}: {metrics}")
             emit('metrics', metrics)
 
     except Exception as e:
