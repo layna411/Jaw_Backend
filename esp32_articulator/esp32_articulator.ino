@@ -158,8 +158,8 @@ void setup() {
 
     // 3. Load saved Server settings from Internal NVS Flash memory
     preferences.begin("articulator", false);
-    server_ip = preferences.getString("server_ip", "180.235.121.245");
-    server_port = preferences.getString("server_port", "8068");
+    server_ip = preferences.getString("server_ip", "180.235.121.245");//server ip address
+    server_port = preferences.getString("server_port", "8068");//server port number
     Serial.printf("Loaded Settings from Flash -> Server IP: %s, Port: %s\n", server_ip.c_str(), server_port.c_str());
 
     // 4. Configure WiFiManager Dynamic Portal
