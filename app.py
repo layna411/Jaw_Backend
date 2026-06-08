@@ -146,6 +146,9 @@ class State:
         self.protrusive_angle = 0
         self.protrusive_disp = 0
         self.last_db_save_time = 0
+        self.last_metrics_emit_time = 0
+        self.last_articulator_print_time = 0
+        self.last_incoming_print_time = 0
 
 state = State()
 
@@ -239,8 +242,11 @@ def process_realtime(patient_id):
 
     # Emit results
     articulator_payload = f"<{state.protrusive_angle:.2f},{state.protrusive_disp:.2f}>"
-    socketio.emit('articulator_cmd', articulator_payload)
-    print(f"🔌 Broadcasted to Articulator: {articulator_payload}")
+    
+    if (current_time - state.last_articulator_print_time) >= 2.0:
+        state.last_articulator_print_time = current_time
+        socketio.emit('articulator_cmd', articulator_payload)
+        print(f"🔌 Broadcasted to Articulator (throttled): {articulator_payload}")
 
     return {
         "protrusive_angle": state.protrusive_angle,
@@ -294,7 +300,10 @@ def handle_sensor_data(data):
     try:
         current_time = time.time()
         patient_id = data.get('patient_id', 'Unknown')
-        print(f"📦 Incoming Socket Data from Patient: {patient_id}")
+        
+        if (current_time - state.last_incoming_print_time) >= 2.0:
+            state.last_incoming_print_time = current_time
+            print(f"📦 Incoming Socket Data from Patient: {patient_id} (throttled)")
         
         # Process Upper
         upper = data.get('upper')
@@ -320,8 +329,10 @@ def handle_sensor_data(data):
         metrics = process_realtime(patient_id)
         
         if metrics:
-            print(f"📊 Emitting metrics to Patient {patient_id}: {metrics}")
-            emit('metrics', metrics)
+            if (current_time - state.last_metrics_emit_time) >= 2.0:
+                state.last_metrics_emit_time = current_time
+                print(f"📊 Emitting metrics to Patient {patient_id} (throttled): {metrics}")
+                emit('metrics', metrics)
 
     except Exception as e:
         print(f"Error processing sensor data: {e}")
